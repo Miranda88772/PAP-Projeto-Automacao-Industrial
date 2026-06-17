@@ -1,0 +1,317 @@
+/**************************************************************
+   ETAR INDUSTRIAL CONTROLLER - VERSÃO FINAL
+   Alternância automática 10s entre Dados e Bombas
+   Com Calibração pH simples no arranque (sem timer)
+**************************************************************/
+
+#include <WiFi.h>
+#include <ThingerESP32.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+/* ================= CONFIGURAÇÃO THINGER.IO ================= */
+#define USERNAME            "Miranda88"
+#define DEVICE_ID           "monitor_agua_01"
+#define DEVICE_CREDENTIAL   "miranda_monitor"
+
+#define WIFI_SSID           "NOVA_2030" // Muda-se consoante a NET que eu queira!
+#define WIFI_PASSWORD       "1segredo@" // Muda-se consoante a NET que eu queira!
+
+ThingerESP32 thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
+
+/* ================= OLED ================= */
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDR   0x3C
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+/* ================= PINOS ================= */
+#define ENC_A        13
+#define ENC_B        14
+#define ENC_PUSH     33
+#define BTN_CONFIRM  15
+#define BTN_BACK     2
+
+#define TRIGGER_PIN  5
+#define ECHO_PIN     18
+#define ONE_WIRE_BUS 22
+#define PH_PIN       35
+#define TURB_PIN     32
+
+#define RELAY_MAIN_PUMP 23
+#define RELAY_PH4       26
+#define RELAY_PH7       27
+
+/* ================= VARIÁVEIS ================= */
+float ph = 7.0;
+float temp = 22.0;
+float ntu = 0.0;
+float level = 0.0;
+float distancia_cm = 0.0;
+
+bool bombaPrincipal = false;
+bool bombaPH4 = false;
+bool bombaPH7 = false;
+
+float ph_slope = -5.70;
+float ph_offset = 19.0;
+
+unsigned long lastReadSensors = 0;
+unsigned long lastBucket = 0;
+unsigned long lastScreenChange = 0;
+unsigned long lastRelayAction = 0;
+
+int currentScreen = 0;
+
+const unsigned long SENSOR_INTERVAL = 1500;
+const unsigned long BUCKET_INTERVAL = 7000;
+const unsigned long SCREEN_INTERVAL = 10000;
+const unsigned long RELAY_DEBOUNCE = 700;
+
+/* ================= SENSORES ================= */
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+/* =========================================================
+   FUNÇÕES DE LEITURA
+========================================================= */
+float lerDistancia() {
+  digitalWrite(TRIGGER_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIGGER_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIGGER_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, 20000);
+  return (dur == 0) ? -1.0 : dur * 0.034 / 2.0;
+}
+
+float lerTensaoMedia(int pin, int amostras = 20) {
+  long soma = 0;
+  for (int i = 0; i < amostras; i++) {
+    soma += analogRead(pin);
+    delay(3);
+  }
+  return (soma / (float)amostras) * (3.3 / 4095.0);
+}
+
+float lerPH() {
+  float v = lerTensaoMedia(PH_PIN);
+  return constrain(ph_offset + (ph_slope * v), 0.0, 14.0);
+}
+
+float lerTurbidezNTU() {
+  float v = lerTensaoMedia(TURB_PIN) * 1.45;
+  if (v < 2.5) return 3000.0;
+  float val = -1120.4 * v * v + 5742.3 * v - 4352.9;
+  return (val < 0) ? 0 : val;
+}
+
+void lerSensores() {
+  distancia_cm = lerDistancia();
+  sensors.requestTemperatures();
+  temp = sensors.getTempCByIndex(0);
+  ph = lerPH();
+  ntu = lerTurbidezNTU();
+  if (distancia_cm > 0) level = constrain(100.0 - distancia_cm, 0.0, 100.0);
+}
+
+/* =========================================================
+   CALIBRAÇÃO pH (Sem Timer)
+========================================================= */
+void calibrarPH() {
+  Serial.println("\n🔧 === CALIBRAÇÃO pH ===");
+  Serial.println("1. Coloque o sensor em solução pH 7.0 e envie '7'");
+  Serial.println("2. Coloque o sensor em solução pH 4.0 e envie '4'");
+  Serial.println("3. Envie 'skip' ou 's' para saltar");
+  Serial.println("4. Envie 'done' quando terminar");
+  Serial.println("================================================\n");
+
+  bool calibracaoConcluida = false;
+
+  while (!calibracaoConcluida) {
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      cmd.trim();
+      cmd.toLowerCase();
+
+      if (cmd == "7") {
+        float v = lerTensaoMedia(PH_PIN);
+        ph_offset = 7.0 - (ph_slope * v);
+        Serial.println("✅ pH 7.0 calibrado!");
+      }
+      else if (cmd == "4") {
+        float v = lerTensaoMedia(PH_PIN);
+        ph_slope = (4.0 - ph_offset) / v;
+        Serial.println("✅ pH 4.0 calibrado!");
+      }
+      else if (cmd == "skip" || cmd == "s") {
+        Serial.println("⏭️ Calibração saltada.");
+        calibracaoConcluida = true;
+      }
+      else if (cmd == "done" || cmd == "fim") {
+        Serial.println("✅ Calibração terminada!");
+        calibracaoConcluida = true;
+      }
+    } else {
+      static unsigned long lastMsg = 0;
+      if (millis() - lastMsg > 4000) {
+        Serial.println("→ Aguardando comando (7, 4, skip ou done)...");
+        lastMsg = millis();
+      }
+    }
+    delay(100);
+  }
+  
+  Serial.println("✅ Calibração finalizada. Sistema a iniciar...\n");
+}
+
+/* =========================================================
+   DATA BUCKETS
+========================================================= */
+void enviarParaBuckets() {
+  pson td;
+  td["distancia_cm"]  = distancia_cm;
+  td["nivel_percent"] = level;
+  td["temperatura_c"] = temp;
+  thing.write_bucket("Temp_Distancia_Tanque", td);
+
+  pson pt;
+  pt["ph"] = ph;
+  pt["turbidez_ntu"] = ntu;
+  thing.write_bucket("sensores_agua_ph_turb", pt);
+}
+
+/* =========================================================
+   TELAS OLED
+========================================================= */
+void drawDataScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(18, 0); display.println("ETAR - DADOS");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  display.setCursor(5,14); display.print("pH   : "); display.println(ph, 2);
+  display.setCursor(5,26); display.print("Temp : "); display.print(temp,1); display.println(" C");
+  display.setCursor(5,38); display.print("NTU  : "); display.println((int)ntu);
+  display.setCursor(5,50); display.print("Nivel: "); display.print((int)level); display.println("%");
+
+  display.drawLine(0,60,128,60,SH110X_WHITE);
+  display.display();
+}
+
+void drawPumpsScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(18, 0); display.println("ESTADO BOMBAS");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  display.setCursor(5,16); display.print("Principal : "); display.println(bombaPrincipal ? "ON " : "OFF");
+  display.setCursor(5,30); display.print("pH + (26) : "); display.println(bombaPH4 ? "ON " : "OFF");
+  display.setCursor(5,44); display.print("pH - (27) : "); display.println(bombaPH7 ? "ON " : "OFF");
+  display.setCursor(5,58); display.print("Mixer     : "); display.println("N/A");
+
+  display.display();
+}
+
+/* =========================================================
+   SETUP
+========================================================= */
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+
+  Serial.println("\n🚀 ETAR INDUSTRIAL CONTROLLER INICIADO");
+  Serial.println("═══════════════════════════════════════════════");
+
+  Wire.begin(21, 19);
+  display.begin(SCREEN_ADDR, true);
+  display.setTextColor(SH110X_WHITE);
+  display.clearDisplay();
+  display.display();
+
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(PH_PIN, INPUT);
+  pinMode(TURB_PIN, INPUT);
+
+  pinMode(RELAY_MAIN_PUMP, OUTPUT); digitalWrite(RELAY_MAIN_PUMP, HIGH);
+  pinMode(RELAY_PH4, OUTPUT);       digitalWrite(RELAY_PH4, HIGH);
+  pinMode(RELAY_PH7, OUTPUT);       digitalWrite(RELAY_PH7, HIGH);
+
+  analogReadResolution(12);
+  sensors.begin();
+
+  Serial.print("🌐 Ligando WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println(" ✅ OK!");
+
+  thing.add_wifi(WIFI_SSID, WIFI_PASSWORD);
+
+  thing["bomba_principal"] << [](pson &in){ 
+    bool st = in; 
+    if(st != bombaPrincipal && millis()-lastRelayAction > RELAY_DEBOUNCE){
+      bombaPrincipal = st; 
+      digitalWrite(RELAY_MAIN_PUMP, st?LOW:HIGH); 
+      lastRelayAction = millis(); 
+    }
+  };
+  thing["bomba_ph4"] << [](pson &in){ 
+    bool st = in; 
+    if(st != bombaPH4 && millis()-lastRelayAction > RELAY_DEBOUNCE){
+      bombaPH4 = st; 
+      digitalWrite(RELAY_PH4, st?LOW:HIGH); 
+      lastRelayAction = millis(); 
+    }
+  };
+  thing["bomba_ph7"] << [](pson &in){ 
+    bool st = in; 
+    if(st != bombaPH7 && millis()-lastRelayAction > RELAY_DEBOUNCE){
+      bombaPH7 = st; 
+      digitalWrite(RELAY_PH7, st?LOW:HIGH); 
+      lastRelayAction = millis(); 
+    }
+  };
+
+  calibrarPH();
+
+  Serial.println("✅ Sistema pronto! Alternando ecrãs a cada 10 segundos.");
+  Serial.println("═══════════════════════════════════════════════\n");
+}
+
+/* =========================================================
+   LOOP PRINCIPAL
+========================================================= */
+void loop() {
+  thing.handle();
+
+  if (millis() - lastReadSensors > SENSOR_INTERVAL) {
+    lerSensores();
+    lastReadSensors = millis();
+  }
+
+  if (millis() - lastBucket > BUCKET_INTERVAL) {
+    enviarParaBuckets();
+    lastBucket = millis();
+  }
+
+  if (millis() - lastScreenChange > SCREEN_INTERVAL) {
+    currentScreen = (currentScreen + 1) % 2;
+    lastScreenChange = millis();
+  }
+
+  static int lastScreenDrawn = -1;
+  if (currentScreen != lastScreenDrawn) {
+    if (currentScreen == 0) drawDataScreen();
+    else drawPumpsScreen();
+    lastScreenDrawn = currentScreen;
+  }
+
+  delay(15);
+}
